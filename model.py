@@ -258,7 +258,7 @@ class TurboMamba(nn.Module):
                 local_caches=None,
             )
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate(self, prompt, uniforms, temperature=1.0, top_p=1.0, trace=False):
         """Sequential ancestral sampling with bounded KV and recurrent state."""
         check_device(prompt)

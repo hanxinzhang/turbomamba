@@ -3,10 +3,9 @@
 Mamba-3 parameterization derives from state-spaces/mamba:
 Copyright (c) 2026, Dao AI Lab, Goombalab. Apache-2.0.
 See THIRD_PARTY_NOTICES.md and LICENSES/mamba-Apache-2.0.txt.
-Training uses Torch autograd; native kernels are inference-only.
+Training, prefill and cached inference use FP32 Torch operations on Apple MPS.
 """
 
-from pathlib import Path
 import hashlib
 import math
 import os
@@ -16,60 +15,6 @@ from torch.nn import functional as F
 
 V = 4096
 D = 128
-LIB = None
-
-
-def bind():
-    global LIB
-    if not hasattr(torch.mps, "compile_shader"):
-        raise RuntimeError(
-            "This package requires torch.mps.compile_shader (tested with PyTorch 2.13)."
-        )
-    if LIB is None:
-        LIB = torch.mps.compile_shader(
-            Path(__file__).with_name("kernels.metal").read_text()
-        )
-    return LIB
-
-
-def native_rms(x, weight):
-    check_device(x)
-    if x.dtype != torch.float32 or x.shape[-1] not in (64, 128):
-        raise TypeError("Native RMS requires FP32 and width 64 or 128")
-    width = x.shape[-1]
-    rows = x.numel() // width
-    y = torch.empty_like(x, memory_format=torch.contiguous_format)
-    if rows:
-        bind().rms_inference(
-            x.contiguous(),
-            weight.contiguous(),
-            y,
-            width,
-            rows,
-            threads=[rows * width, 1, 1],
-            group_size=[width, 1, 1],
-        )
-    return y
-
-
-def native_gate(x):
-    check_device(x)
-    if x.dtype != torch.float32:
-        raise TypeError("Native gate requires FP32")
-    ff = x.shape[-1] // 2
-    rows = x.numel() // (2 * ff)
-    y = torch.empty((*x.shape[:-1], ff), device=x.device, dtype=x.dtype)
-    if rows:
-        count = rows * ff
-        bind().gate_inference(
-            x.contiguous(),
-            y,
-            ff,
-            rows,
-            threads=[((count + 63) // 64) * 64, 1, 1],
-            group_size=[64, 1, 1],
-        )
-    return y
 
 
 def check_device(x=None):
@@ -86,17 +31,10 @@ class RMS(nn.Module):
 
     def forward(self, x):
         check_device(x)
-        if (
-            not torch.is_grad_enabled()
-            and os.environ.get("TURBOMAMBA_FUSIONS", "1") == "1"
-        ):
-            return native_rms(x, self.weight)
         return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-5) * self.weight
 
 
 def silu_gate(projected):
-    if not torch.is_grad_enabled() and os.environ.get("TURBOMAMBA_FUSIONS", "1") == "1":
-        return native_gate(projected)
     a, b = projected.chunk(2, -1)
     return a * F.silu(b)
 
@@ -269,12 +207,108 @@ def chunk_scan(q, k, v, adt, dt, trap, z, skip, outw, chunk):
     return out, final
 
 
+def _tensor_metadata(tensor, shape, name):
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(name + ' must be a tensor')
+    check_device(tensor)
+    if tensor.dtype != torch.float32 or tuple(tensor.shape) != tuple(shape):
+        raise ValueError(name + ' must be MPS FP32 with shape ' + str(tuple(shape)))
+
+def _rms64(x, weight):
+    # Use the same RMS law and existing learned scale as the full-sequence path.
+    return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-5) * weight
+
+def _rotate_siso(x, phase):
+    # Match rotate(..., False): rotate adjacent pairs in the first
+    # 32 of 64 state coordinates; the remaining 32 coordinates are unchanged.
+    pairs = x[..., :32].reshape(*x.shape[:-1], 16, 2)
+    a, b = pairs[..., 0], pairs[..., 1]
+    cs, sn = phase.cos()[:, :, None], phase.sin()[:, :, None]
+    rotated = torch.stack((a * cs - b * sn, a * sn + b * cs), -1).flatten(-2)
+    return torch.cat((rotated, x[..., 32:]), -1)
+
+def torch_siso_step(self, u, cache):
+    """FP32 SISO recurrence with phase rotation and trapezoidal state update.
+
+    Input u is [batch,1,128]. Cache is (phase [B,4,16], state [B,4,P,N],
+    previous_k [B,4,1,64], previous_v [B,4,1,64]), with P=N=64.
+    No Tensor values are copied to the CPU, and there is no synchronization.
+    """
+    if torch.is_grad_enabled():
+        raise RuntimeError('Decode is inference-only')
+    check_device(u)
+    if self.rank != 1:
+        raise ValueError('The Torch step supports only SISO rank 1')
+    if u.ndim != 3 or u.shape[1:] != (1, 128) or u.shape[0] < 1:
+        raise ValueError('Input must have shape [positive batch,1,128]')
+    batch = u.shape[0]
+    _tensor_metadata(u, (batch, 1, 128), 'u')
+    if not isinstance(cache, (tuple, list)) or len(cache) != 4:
+        raise ValueError('Expected the original four-tensor Mixer cache')
+    old_phase, old_state, previous_k, previous_v = cache
+    for name, tensor, shape in (
+        ('old_phase', old_phase, (batch, 4, 16)),
+        ('old_state', old_state, (batch, 4, 64, 64)),
+        ('previous_k', previous_k, (batch, 4, 1, 64)),
+        ('previous_v', previous_v, (batch, 4, 1, 64)),
+        ('in_proj.weight', self.in_proj.weight, (668, 128)),
+        ('out_proj.weight', self.out_proj.weight, (128, 256)),
+        ('dt_bias', self.dt_bias, (4,)),
+        ('B_bias', self.B_bias, (4, 1, 64)),
+        ('C_bias', self.C_bias, (4, 1, 64)),
+        ('B_norm.weight', self.B_norm.weight, (64,)),
+        ('C_norm.weight', self.C_norm.weight, (64,)),
+        ('D', self.D, (4,)),
+        ('mimo_x', self.mimo_x, (4, 1, 64)),
+        ('mimo_z', self.mimo_z, (4, 1, 64)),
+        ('mimo_o', self.mimo_o, (4, 1, 64)),
+    ):
+        _tensor_metadata(tensor, shape, name)
+
+    z_raw, v_raw, k_raw, q_raw, dd, aa, tr, ang = self.in_proj(u).split(
+        (256, 256, 64, 64, 4, 4, 4, 16), -1
+    )
+    dt = F.softplus(dd[:, 0] + self.dt_bias)
+    decay = (-(aa[:, 0].clamp_min(0) +
+               torch.reciprocal(1 - aa[:, 0].clamp_max(0)))).clamp_max(-1e-4)
+    trap = tr[:, 0].sigmoid()
+    phase = old_phase + torch.tanh(ang[:, 0])[:, None] * math.pi * dt[:, :, None]
+
+    k = _rms64(k_raw[:, 0], self.B_norm.weight)[:, None, None] + self.B_bias[None]
+    q = _rms64(q_raw[:, 0], self.C_norm.weight)[:, None, None] + self.C_bias[None]
+    k, q = _rotate_siso(k, phase), _rotate_siso(q, phase)
+    v = v_raw[:, 0].reshape(batch, 4, 1, 64) * self.mimo_x[None]
+    z = z_raw[:, 0].reshape(batch, 4, 1, 64) * self.mimo_z[None]
+
+    alpha = (dt * decay).exp()
+    beta = alpha * (1 - trap) * dt
+    gamma = trap * dt
+    previous_outer = previous_v[:, :, 0, :, None] * previous_k[:, :, 0, None, :]
+    current_outer = v[:, :, 0, :, None] * k[:, :, 0, None, :]
+    state = (alpha[:, :, None, None] * old_state +
+             beta[:, :, None, None] * previous_outer +
+             gamma[:, :, None, None] * current_outer)
+
+    readout = torch.matmul(state, q[:, :, 0, :, None]).squeeze(-1)
+    out = (readout + self.D[None, :, None] * v[:, :, 0])
+    out = out * F.silu(z[:, :, 0]) * self.mimo_o[None, :, 0]
+    y = self.out_proj(out.reshape(batch, 1, 256))
+    return y, (phase.contiguous(), state.contiguous(), k.contiguous(), v.contiguous())
+
+
+def _owned_output(module, inputs, output):
+    if torch.is_grad_enabled():
+        return output
+    return output.clone(memory_format=torch.contiguous_format)
+
+
 class Mixer(nn.Module):
     def __init__(self):
         super().__init__()
         self.rank = 1
         self.chunk = 32
         self.in_proj = nn.Linear(128, 668, bias=False)
+        self.in_proj.register_forward_hook(_owned_output)
         self.out_proj = nn.Linear(256, 128, bias=False)
         dt = torch.exp(
             torch.rand(4) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)
@@ -327,58 +361,7 @@ class Mixer(nn.Module):
         )
 
     def step(self, u, cache):
-        if torch.is_grad_enabled():
-            raise RuntimeError("Decode is inference-only")
-        bind()
-        B = u.shape[0]
-        proj = self.in_proj(u).reshape(B, -1).contiguous()
-        oldangle, state, oldk, oldv = cache
-        q = torch.empty((B, 4, 1, 64), device=u.device)
-        k = torch.empty_like(q)
-        v = torch.empty_like(q)
-        z = torch.empty_like(q)
-        coeff = torch.empty((B, 4, 3), device=u.device)
-        angle = torch.empty_like(oldangle)
-        out = torch.empty((B, 4, 64), device=u.device)
-        LIB.prep(
-            proj,
-            self.dt_bias,
-            self.C_bias,
-            self.B_bias,
-            self.C_norm.weight,
-            self.B_norm.weight,
-            self.mimo_x,
-            self.mimo_z,
-            oldangle,
-            q,
-            k,
-            v,
-            z,
-            coeff,
-            angle,
-            1,
-            B,
-            threads=[B * 4 * 64, 1, 1],
-            group_size=[64, 1, 1],
-        )
-        LIB.step(
-            q,
-            k,
-            v,
-            z,
-            coeff,
-            oldk,
-            oldv,
-            state,
-            self.D,
-            self.mimo_o,
-            out,
-            1,
-            B,
-            threads=[B * 256, 1, 1],
-            group_size=[64, 1, 1],
-        )
-        return self.out_proj(out.reshape(B, 1, 256)), (angle, state, k, v)
+        return torch_siso_step(self, u, cache)
 
 
 class MambaBlock(nn.Module):

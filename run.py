@@ -33,16 +33,49 @@ def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2) + "\n")
 
 
+def training_bank(path):
+    """Validate host token IDs before any conversion or neural execution."""
+    import numpy as np
+
+    with np.load(path, allow_pickle=False) as source:
+        bank = source["X"].copy()
+    if bank.ndim != 2 or bank.shape[1] != 256 or len(bank) < 1:
+        raise ValueError("Expected X[windows,256] within-document target windows")
+    if not np.issubdtype(bank.dtype, np.integer):
+        raise ValueError("Training token IDs must have an integer dtype")
+    if bank.min() < 0 or bank.max() >= 4096:
+        raise ValueError("Training IDs must be in the 4096-word vocabulary")
+    return np.ascontiguousarray(bank, dtype=np.int64)
+
+
+def training_tokenizer_hash(data_path, tokenizer_path, bank_hash):
+    """Bind the declared tokenizer and verify a prepare manifest when present."""
+    identity = sha(tokenizer_path)
+    manifest_path = Path(data_path).parent / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("train_sha256") != bank_hash:
+            raise ValueError("Training bank does not match its prepare manifest")
+        if manifest.get("tokenizer_sha256") != identity:
+            raise ValueError("Training tokenizer does not match its prepare manifest")
+    return identity
+
+
+def checkpoint_identity(saved, config, tokenizer_hash):
+    if not isinstance(saved, dict) or saved.get("format") != "turbomamba-tiny-v1":
+        raise ValueError("Unsupported checkpoint format")
+    if saved.get("config") != config:
+        raise ValueError("Checkpoint configuration mismatch")
+    if saved.get("tokenizer_sha256") != tokenizer_hash:
+        raise ValueError("Checkpoint tokenizer identity mismatch or missing identity")
+
+
 def gpu():
     import torch
 
     if not torch.backends.mps.is_available():
         raise RuntimeError(
             "Apple MPS is required. No CPU/CUDA model fallback is implemented."
-        )
-    if not hasattr(torch.mps, "compile_shader"):
-        raise RuntimeError(
-            "torch.mps.compile_shader is required (tested with PyTorch 2.13)."
         )
     return torch
 
@@ -136,7 +169,7 @@ def prepare(args):
             windows=len(windows),
             target_length=256,
             split="TRAIN: host hash bucket >=20; DEV/TEST hosts excluded",
-            scope="Bounded public demo; a different sample from the manuscript's frozen eight-arm comparison",
+            scope="Bounded public demo; a different sample from the frozen manuscript comparison",
         ),
     )
     print(
@@ -146,7 +179,9 @@ def prepare(args):
     )
 
 
-def checkpoint(path, model, optimizer, args, update, order, cursor, rng, bank_hash):
+def checkpoint(
+    path, model, optimizer, args, update, order, cursor, rng, bank_hash, tokenizer_hash
+):
     import torch
     from model import CONFIG
 
@@ -160,6 +195,7 @@ def checkpoint(path, model, optimizer, args, update, order, cursor, rng, bank_ha
         learning_rate=args.lr,
         batch=args.batch,
         train_bank_sha256=bank_hash,
+        tokenizer_sha256=tokenizer_hash,
         torch_rng=torch.get_rng_state(),
         mps_rng=torch.mps.get_rng_state(),
         numpy_rng=json.dumps(rng.bit_generator.state),
@@ -174,15 +210,11 @@ def checkpoint(path, model, optimizer, args, update, order, cursor, rng, bank_ha
 def train(args):
     import numpy as np
 
+    bank = training_bank(args.data)
+    bank_hash = sha(args.data)
+    tokenizer_hash = training_tokenizer_hash(args.data, args.tokenizer, bank_hash)
     torch = gpu()
-    from model import TurboMamba
-
-    with np.load(args.data, allow_pickle=False) as source:
-        bank = source["X"].copy()
-    if bank.ndim != 2 or bank.shape[1] != 256 or len(bank) < 1:
-        raise ValueError("Expected X[windows,256] within-document target windows")
-    if bank.min() < 0 or bank.max() >= 4096:
-        raise ValueError("Training IDs must be in the 4096-word vocabulary")
+    from model import CONFIG, TurboMamba
     args.out_dir.mkdir(parents=True, exist_ok=True)
     model = TurboMamba(args.seed).train()
     # Matches the experiment: all parameters decay, including Mamba no_decay flags.
@@ -193,10 +225,9 @@ def train(args):
     order, cursor, completed = rng.permutation(len(bank)), 0, 0
     if args.resume:
         saved = torch.load(args.resume, map_location="cpu", weights_only=True)
-        if saved["format"] != "turbomamba-tiny-v1" or saved["train_bank_sha256"] != sha(
-            args.data
-        ):
-            raise ValueError("Checkpoint format or training-bank identity mismatch")
+        checkpoint_identity(saved, CONFIG, tokenizer_hash)
+        if saved["train_bank_sha256"] != bank_hash:
+            raise ValueError("Checkpoint training-bank identity mismatch")
         if (saved["seed"], saved["learning_rate"], saved["batch"]) != (
             args.seed,
             args.lr,
@@ -245,6 +276,8 @@ def train(args):
         history.append(row)
         if update == completed or (update + 1) % 10 == 0 or update + 1 == args.steps:
             print(json.dumps(row), flush=True)
+    if sha(args.tokenizer) != tokenizer_hash or sha(args.data) != bank_hash:
+        raise ValueError("Training bank or tokenizer changed during this run")
     checkpoint(
         args.out_dir / "checkpoint.pt",
         model,
@@ -254,7 +287,8 @@ def train(args):
         order,
         cursor,
         rng,
-        sha(args.data),
+        bank_hash,
+        tokenizer_hash,
     )
     torch.mps.synchronize()
     labels = max(0, args.steps - completed) * args.batch * 256
@@ -289,8 +323,7 @@ def infer(args):
 
     model = TurboMamba(args.seed).eval()
     saved = torch.load(args.checkpoint, weights_only=True, map_location="cpu")
-    if saved.get("format") != "turbomamba-tiny-v1" or saved.get("config") != CONFIG:
-        raise ValueError("Unsupported checkpoint configuration")
+    checkpoint_identity(saved, CONFIG, sha(args.tokenizer))
     model.load_state_dict(saved["model"], strict=True)
     tokenizer = Tokenizer.from_file(str(args.tokenizer))
     ids = tokenizer.encode(args.prompt).ids
@@ -298,12 +331,13 @@ def infer(args):
     uniforms = (
         np.random.default_rng(args.seed).random((1, args.tokens)).astype(np.float32)
     )
-    result = model.generate(
-        prompt,
-        torch.from_numpy(uniforms).to("mps"),
-        temperature=args.temperature,
-        top_p=args.top_p,
-    )
+    with torch.no_grad():
+        result = model.generate(
+            prompt,
+            torch.from_numpy(uniforms).to("mps"),
+            temperature=args.temperature,
+            top_p=args.top_p,
+        )
     torch.mps.synchronize()
     words = result["words"].cpu().numpy()[0].tolist()
     print(tokenizer.decode(ids + words, skip_special_tokens=False))
@@ -324,14 +358,14 @@ def verify(args):
 
     torch = gpu()
     from model import TurboMamba
-    from mamba_mps import native_gate, native_rms
+    from mamba_mps import sample
 
     model = TurboMamba(args.seed)
     rng = np.random.default_rng(args.seed)
     # Repeated labels exercise the count mixture; >128 labels exercise eviction.
     tokens = torch.from_numpy(rng.integers(0, 64, (2, 144), dtype=np.int64)).to("mps")
     arrays, results = {}, {}
-    with torch.inference_mode():
+    with torch.no_grad():
         full = model.factors(tokens, observed_only=False)
         lp = full["lp"]
         selected = lp.gather(-1, tokens[..., None]).squeeze(-1)
@@ -354,6 +388,8 @@ def verify(args):
                 (cached - lp[:, context : context + generated]).abs().max().cpu()
             )
             final = context + generated
+            final_head = model.probabilities(state)
+            final_error = float((final_head - lp[:, final]).abs().max().cpu())
             if (
                 state["committed"] != final
                 or state["phase"] != final % 4
@@ -368,28 +404,107 @@ def verify(args):
                     context=context,
                     generated=generated,
                     max_log_probability_error=error,
+                    final_commit_max_log_probability_error=final_error,
                 )
             )
             arrays[f"C{context}_G{generated}_cached"] = cached.cpu().numpy()
+            arrays[f"C{context}_G{generated}_reference"] = lp[
+                :, context : context + generated
+            ].cpu().numpy()
+            arrays[f"C{context}_G{generated}_final_cached"] = final_head.cpu().numpy()
+            arrays[f"C{context}_G{generated}_final_reference"] = lp[:, final].cpu().numpy()
         changed = tokens.clone()
         changed[:, 71:] = (changed[:, 71:] + 13) % 64
         causal = model.factors(changed, observed_only=False)["lp"][:, :72]
         results["causal_max"] = float((causal - lp[:, :72]).abs().max().cpu())
         # Position71's label changed, so only positions0..70 share their targets;
         # full probability law at71 remains identical because token71 is unseen.
-        x = torch.from_numpy(rng.normal(size=(2, 5, 128)).astype(np.float32)).to("mps")
-        weight = torch.from_numpy(rng.normal(size=128).astype(np.float32)).to("mps")
-        reference = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-5) * weight
-        results["native_rms_max"] = float(
-            (native_rms(x, weight) - reference).abs().max().cpu()
-        )
-        z = torch.from_numpy(rng.normal(size=(2, 5, 1018)).astype(np.float32)).to("mps")
-        a, b = z.chunk(2, -1)
-        results["native_gate_max"] = float(
-            (native_gate(z) - a * torch.nn.functional.silu(b)).abs().max().cpu()
-        )
         arrays["full_log_probabilities"] = lp.cpu().numpy()
         arrays["tokens"] = tokens.cpu().numpy()
+        generation_cases = []
+        model.eval()
+        # Exercise actual sampled histories, all vocabulary IDs and two batches.
+        # Four extra labels expose the prediction after the last committed token;
+        # they are never part of prompt history or the generation request.
+        for batch in (1, 32):
+            prompt = torch.from_numpy(
+                rng.integers(0, 4096, (batch, 256), dtype=np.int64)
+            ).to("mps")
+            uniforms = torch.from_numpy(
+                rng.random((batch, 128)).astype(np.float32)
+            ).to("mps")
+            generated = model.generate(
+                prompt, uniforms, temperature=0.8, top_p=0.9, trace=True
+            )
+            whole = torch.cat(
+                (
+                    prompt,
+                    generated["words"],
+                    torch.zeros((batch, 4), dtype=torch.int64, device="mps"),
+                ),
+                1,
+            )
+            reference = model.factors(whole, observed_only=False)
+            cached = generated["heads"]
+            reference_heads = reference["lp"][:, 256:384]
+            final_head = model.probabilities(generated["state"])
+            final_reference = reference["lp"][:, 384]
+            raw_error = (cached - reference_heads).abs().max()
+            final_error = (final_head - final_reference).abs().max()
+            normalization_error = (cached.exp().sum(-1) - 1).abs().max()
+            # Check the actual sampling transform against the retained raw heads.
+            # Cached/full log-law agreement is guarded separately; this avoids
+            # treating a floating-point CDF-boundary difference as a law failure.
+            probability = (cached / 0.8).softmax(-1)
+            values, indices = probability.sort(-1, descending=True)
+            values = values * (values.cumsum(-1) - values < 0.9)
+            probability = torch.zeros_like(probability).scatter(-1, indices, values)
+            replayed = sample(
+                probability.flatten(0, 1), uniforms.reshape(-1)
+            ).reshape(batch, 128)
+            sampling_mismatches = (replayed != generated["words"]).sum()
+            state = generated["state"]
+            if (
+                state["committed"] != 384
+                or state["phase"] != 0
+                or len(state["pending"]) != 0
+                or state["global_position"] != 97
+                or state["ring"].shape[1] != 128
+            ):
+                raise AssertionError("Actual generation final-commit state mismatch")
+            gathered = reference["lp"].gather(-1, whole[..., None]).squeeze(-1)
+            prefix = f"sampled_B{batch}_C256_G128"
+            arrays[prefix + "_prompt"] = prompt.cpu().numpy()
+            arrays[prefix + "_uniforms"] = uniforms.cpu().numpy()
+            arrays[prefix + "_generated"] = generated["words"].cpu().numpy()
+            arrays[prefix + "_whole_targets"] = whole.cpu().numpy()
+            arrays[prefix + "_cached"] = cached.cpu().numpy()
+            arrays[prefix + "_reference"] = reference_heads.cpu().numpy()
+            arrays[prefix + "_selected"] = reference["selected"].cpu().numpy()
+            arrays[prefix + "_gathered_full_labels"] = gathered.cpu().numpy()
+            arrays[prefix + "_final_cached"] = final_head.cpu().numpy()
+            arrays[prefix + "_final_reference"] = final_reference.cpu().numpy()
+            arrays[prefix + "_replayed_words"] = replayed.cpu().numpy()
+            generation_cases.append(
+                dict(
+                    batch=batch,
+                    context=256,
+                    generated=128,
+                    temperature=0.8,
+                    top_p=0.9,
+                    max_log_probability_error=float(raw_error.cpu()),
+                    final_commit_max_log_probability_error=float(final_error.cpu()),
+                    normalization_max=float(normalization_error.cpu()),
+                    sampling_mismatches=int(sampling_mismatches.cpu()),
+                    selected_vs_full_max=float(
+                        (gathered - reference["selected"]).abs().max().cpu()
+                    ),
+                    committed=state["committed"],
+                )
+            )
+            # Retain only compared evidence on CPU, not the un-compared full LP.
+            del reference, reference_heads, final_reference, cached, generated
+            del probability, values, indices, replayed, gathered, state, final_head
     model.train()
     small = tokens[:, :16]
     model.zero_grad(set_to_none=True)
@@ -409,16 +524,24 @@ def verify(args):
         errors.append((p.grad - gradients[name]).abs().max())
     results["gradient_max"] = float(torch.stack(errors).max().cpu())
     results["cases"] = cases
+    results["generation_cases"] = generation_cases
     guards = dict(
         selected_vs_full_max=3e-5,
         normalization_max=3e-5,
         causal_max=1e-5,
-        native_rms_max=3e-5,
-        native_gate_max=3e-5,
         gradient_max=3e-5,
     )
     if any(results[name] > bound for name, bound in guards.items()) or any(
-        row["max_log_probability_error"] > 3e-4 for row in cases
+        row["max_log_probability_error"] > 3e-4
+        or row["final_commit_max_log_probability_error"] > 3e-4
+        for row in cases
+    ) or any(
+        row["max_log_probability_error"] > 3e-4
+        or row["final_commit_max_log_probability_error"] > 3e-4
+        or row["normalization_max"] > 3e-5
+        or row["selected_vs_full_max"] > 3e-5
+        or row["sampling_mismatches"] != 0
+        for row in generation_cases
     ):
         raise AssertionError(json.dumps(results))
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -433,7 +556,7 @@ def verify(args):
         parameters=sum(p.numel() for p in model.parameters()),
         arrays_sha256=sha(args.out_dir / "verification_arrays.npz"),
         guards=guards,
-        scope="Finite mathematical/kernel consistency; no quality or performance benchmark",
+        scope="Finite full/cached/generation/gradient consistency; no quality or performance benchmark",
     )
     write_json(args.out_dir / "verification.json", results)
     print(json.dumps(results))
@@ -454,6 +577,10 @@ def main():
         "train", help="Train only on MPS; constant LR after ten-step warmup"
     )
     p.add_argument("--data", type=Path, default=Path("data/train.npz"))
+    p.add_argument(
+        "--tokenizer", type=Path, default=HERE / "tokenizer.json",
+        help="Tokenizer identity associated with the training token IDs",
+    )
     p.add_argument("--steps", type=int, default=100)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--lr", type=float, default=0.003)
@@ -471,7 +598,7 @@ def main():
     p.add_argument("--seed", type=int, default=9201)
     p.set_defaults(function=infer)
     p = sub.add_parser(
-        "verify", help="GPU-only full/cached/gradient/kernel consistency"
+        "verify", help="MPS full/cached/generated-law/final-commit/gradient consistency"
     )
     p.add_argument("--seed", type=int, default=9201)
     p.add_argument("--out-dir", type=Path, default=Path("out/verification"))

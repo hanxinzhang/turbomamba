@@ -2,8 +2,8 @@
 
 ## Mamba-3
 
-The Mamba-3 parameterization and recurrent law in `mamba_mps.py` and
-`kernels.metal` are adapted from the state-spaces/mamba project.
+The Mamba-3 parameterization and recurrent law in `mamba_mps.py`
+are adapted from the state-spaces/mamba project.
 
 - Source: https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba3.py
 - Upstream module notice: **Copyright (c) 2026, Dao AI Lab, Goombalab.**
@@ -11,9 +11,9 @@ The Mamba-3 parameterization and recurrent law in `mamba_mps.py` and
 - License: Apache License, Version 2.0; full text in `LICENSES/mamba-Apache-2.0.txt`.
 
 Modifications use fixed width 128, state size 64, SISO rank 1, FP32 real-valued
-phase rotations, matrix SSD training/prefill in Torch and an Apple MPS Metal
-recurrent step. Official CUDA/Triton/TileLang/CuTe kernels are not included.
-RMS and SwiGLU Metal primitives are inference-only; autograd uses ordinary Torch.
+phase rotations, matrix SSD training/prefill in Torch and a Torch MPS SISO
+recurrent step. RMS and SwiGLU use ordinary Torch operations. Official
+CUDA/Triton/TileLang/CuTe kernels are not included.
 
 ## FineWeb-Edu and tokenizer
 
